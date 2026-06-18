@@ -11,7 +11,6 @@ concurrency:
 permissions:
   contents: read
   pull-requests: write
-  security-events: write
 
 jobs:
   lint-and-test:
@@ -55,9 +54,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Salesforce CLI
-        uses: salesforcecli/setup-sf-cli@v1
-        with:
-          version: latest
+        run: npm install -g @salesforce/cli
 
       - name: Install Code Analyzer plugin
         run: sf plugins install @salesforce/sfdx-scanner
@@ -74,12 +71,6 @@ jobs:
             --format sarif \
             --outfile results/scanner-report.sarif \
             --severity-threshold 2 || echo "scanner_failed=true" >> "$GITHUB_OUTPUT"
-
-      - name: Upload SARIF to GitHub Security
-        if: always() && hashFiles('results/scanner-report.sarif') != ''
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: results/scanner-report.sarif
 
       - name: Fail if scanner found critical issues
         if: steps.scanner.outputs.scanner_failed == 'true'
@@ -98,9 +89,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install Salesforce CLI
-        uses: salesforcecli/setup-sf-cli@v1
-        with:
-          version: latest
+        run: npm install -g @salesforce/cli
 
       - name: Install sfdx-git-delta plugin
         run: echo y | sf plugins install sfdx-git-delta
@@ -120,10 +109,13 @@ jobs:
         env:
           SF_AUTH_URL: ${{ github.base_ref == 'main' && secrets.PROD_SF_AUTH_URL || secrets.UAT_SF_AUTH_URL }}
         run: |
-          echo "${SF_AUTH_URL}" | sf org login sfdx-url --sfdx-url-stdin --alias ${{ steps.org-config.outputs.org_alias }} --set-default
+          echo "${SF_AUTH_URL}" > /tmp/sfdx-auth-url.txt
+          sf org login sfdx-url --sfdx-url-file /tmp/sfdx-auth-url.txt --alias ${{ steps.org-config.outputs.org_alias }} --set-default
+          rm -f /tmp/sfdx-auth-url.txt
 
       - name: Generate delta package (changed metadata only)
         run: |
+          mkdir -p delta
           sf sgd source delta \
             --from "origin/${{ github.base_ref }}" \
             --to "HEAD" \
@@ -171,7 +163,7 @@ jobs:
           eval $DEPLOY_CMD | tee deploy-result.json
           echo "deploy_exit_code=$?" >> "$GITHUB_OUTPUT"
 
-      - name: Check code coverage threshold
+      - name: Check org-wide code coverage threshold
         if: steps.delta-check.outputs.has_changes == 'true'
         run: |
           if [ -f "results/coverage/coverage-summary.json" ]; then
@@ -183,6 +175,53 @@ jobs:
             fi
           else
             echo "::warning::Coverage report not found. Ensure Apex tests produce coverage data."
+          fi
+
+      - name: Check per-class coverage for changed Apex classes (80% minimum)
+        if: steps.delta-check.outputs.has_changes == 'true'
+        run: |
+          # Get list of Apex classes changed in this PR
+          CHANGED_CLASSES=$(git diff --name-only "origin/${{ github.base_ref }}"...HEAD -- 'force-app/**/*.cls' | \
+            grep -v 'Test\.' | grep -v '_Test\.' | grep -v 'test\.' | \
+            sed 's|.*/||' | sed 's|\.cls||')
+
+          if [ -z "$CHANGED_CLASSES" ]; then
+            echo "No non-test Apex classes changed in this PR."
+            exit 0
+          fi
+
+          echo "Changed Apex classes: $CHANGED_CLASSES"
+          FAILED=false
+
+          if [ -f "deploy-result.json" ]; then
+            for CLASS in $CHANGED_CLASSES; do
+              CLASS_COV=$(jq -r --arg cls "$CLASS" '
+                .result.details.runTestResult.codeCoverage[]? |
+                select(.name == $cls) |
+                (if (.numLocations // 0) == 0 then 100
+                 else (((.numLocations - .numLocationsNotCovered) / .numLocations) * 100)
+                 end)
+              ' deploy-result.json 2>/dev/null)
+
+              if [ -z "$CLASS_COV" ] || [ "$CLASS_COV" == "null" ]; then
+                echo "::error::Class '$CLASS' has no test coverage data. Ensure a test class covers it."
+                FAILED=true
+              elif (( $(echo "$CLASS_COV < 80" | bc -l) )); then
+                echo "::error::Class '$CLASS' has ${CLASS_COV}% coverage (minimum 80% required)"
+                FAILED=true
+              else
+                echo "✓ $CLASS: ${CLASS_COV}%"
+              fi
+            done
+          else
+            echo "::error::No deploy result found to check coverage."
+            FAILED=true
+          fi
+
+          if [ "$FAILED" == "true" ]; then
+            echo ""
+            echo "::error::One or more Apex classes do not meet the 80% per-class coverage requirement."
+            exit 1
           fi
 
       - name: Post deploy summary as PR comment
