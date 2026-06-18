@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ruleset name="Salesforce Apex Rules"
+  xmlns="http://pmd.sourceforge.net/ruleset/2.0.0"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://pmd.sourceforge.net/ruleset/2.0.0 https://pmd.sourceforge.io/ruleset_2_0_0.xsd">
+
+  <description>Custom PMD rules for Apex code quality enforcement in CI</description>
+
+  <!-- Performance -->
+  <rule ref="category/apex/performance.xml/OperationWithLimitsInLoop" />
+  <rule ref="category/apex/performance.xml/AvoidDebugStatements">
+    <priority>3</priority>
+  </rule>
+
+  <!-- Best Practices -->
+  <rule ref="category/apex/bestpractices.xml/ApexUnitTestClassShouldHaveAsserts" />
+  <rule ref="category/apex/bestpractices.xml/ApexUnitTestShouldNotUseSeeAllDataTrue" />
+  <rule ref="category/apex/bestpractices.xml/AvoidGlobalModifier" />
+  <rule ref="category/apex/bestpractices.xml/UnusedLocalVariable" />
+
+  <!-- Security -->
+  <rule ref="category/apex/security.xml/ApexCRUDViolation" />
+  <rule ref="category/apex/security.xml/ApexSharingViolations" />
+  <rule ref="category/apex/security.xml/ApexSOQLInjection" />
+  <rule ref="category/apex/security.xml/ApexOpenRedirect" />
+  <rule ref="category/apex/security.xml/ApexXSSFromURLParam" />
+  <rule ref="category/apex/security.xml/ApexXSSFromEscapeFalse" />
+
+  <!-- Error Prone -->
+  <rule ref="category/apex/errorprone.xml/AvoidHardcodingId" />
+  <rule ref="category/apex/errorprone.xml/EmptyCatchBlock" />
+  <rule ref="category/apex/errorprone.xml/EmptyIfStmt" />
+  <rule ref="category/apex/errorprone.xml/EmptyWhileStmt" />
+  <rule ref="category/apex/errorprone.xml/MethodWithSameNameAsEnclosingClass" />
+
+  <!-- Design / Complexity -->
+  <rule ref="category/apex/design.xml/CyclomaticComplexity">
+    <properties>
+      <property name="classReportLevel" value="40" />
+      <property name="methodReportLevel" value="15" />
+    </properties>
+  </rule>
+  <rule ref="category/apex/design.xml/ExcessiveParameterList">
+    <properties>
+      <property name="minimum" value="5" />
+    </properties>
+  </rule>
+
+</ruleset>

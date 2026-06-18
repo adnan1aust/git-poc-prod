@@ -1,0 +1,253 @@
+name: Validate Pull Request
+
+on:
+  pull_request:
+    branches: [uat, main]
+
+concurrency:
+  group: validate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write
+
+jobs:
+  lint-and-test:
+    name: Lint, Format & Unit Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check formatting (Prettier)
+        run: npm run prettier:verify
+
+      - name: Lint LWC & Aura (ESLint)
+        run: npm run lint -- --no-error-on-unmatched-pattern
+
+      - name: Run LWC Jest tests
+        run: npm run test:unit:coverage
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lwc-coverage
+          path: coverage/
+          retention-days: 5
+
+  code-analysis:
+    name: Salesforce Code Analyzer
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Salesforce CLI
+        uses: salesforcecli/setup-sf-cli@v1
+        with:
+          version: latest
+
+      - name: Install Code Analyzer plugin
+        run: sf plugins install @salesforce/sfdx-scanner
+
+      - name: Create results directory
+        run: mkdir -p results
+
+      - name: Run Code Analyzer
+        id: scanner
+        run: |
+          sf scanner run \
+            --target "force-app" \
+            --pmdconfig "config/pmd-ruleset.xml" \
+            --format sarif \
+            --outfile results/scanner-report.sarif \
+            --severity-threshold 2 || echo "scanner_failed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload SARIF to GitHub Security
+        if: always() && hashFiles('results/scanner-report.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results/scanner-report.sarif
+
+      - name: Fail if scanner found critical issues
+        if: steps.scanner.outputs.scanner_failed == 'true'
+        run: |
+          echo "::error::Code Analyzer found High or Critical severity findings. Check the Security tab for details."
+          exit 1
+
+  validate-deploy:
+    name: Validate Deployment & Apex Tests
+    runs-on: ubuntu-latest
+    needs: [lint-and-test, code-analysis]
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Salesforce CLI
+        uses: salesforcecli/setup-sf-cli@v1
+        with:
+          version: latest
+
+      - name: Install sfdx-git-delta plugin
+        run: echo y | sf plugins install sfdx-git-delta
+
+      - name: Determine target org
+        id: org-config
+        run: |
+          if [[ "${{ github.base_ref }}" == "main" ]]; then
+            echo "org_alias=prod" >> "$GITHUB_OUTPUT"
+            echo "auth_secret=PROD_SF_AUTH_URL" >> "$GITHUB_OUTPUT"
+          else
+            echo "org_alias=uat" >> "$GITHUB_OUTPUT"
+            echo "auth_secret=UAT_SF_AUTH_URL" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Authenticate to target org
+        env:
+          SF_AUTH_URL: ${{ github.base_ref == 'main' && secrets.PROD_SF_AUTH_URL || secrets.UAT_SF_AUTH_URL }}
+        run: |
+          echo "${SF_AUTH_URL}" | sf org login sfdx-url --sfdx-url-stdin --alias ${{ steps.org-config.outputs.org_alias }} --set-default
+
+      - name: Generate delta package (changed metadata only)
+        run: |
+          sf sgd source delta \
+            --from "origin/${{ github.base_ref }}" \
+            --to "HEAD" \
+            --output "delta" \
+            --generate-delta
+
+      - name: Check for deployable changes
+        id: delta-check
+        run: |
+          if [ -f "delta/package/package.xml" ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No metadata changes detected in this PR."
+          fi
+
+      - name: Check for destructive changes
+        id: destructive-check
+        run: |
+          if [ -f "delta/destructiveChanges/destructiveChanges.xml" ]; then
+            echo "has_destructive=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::This PR contains destructive changes (metadata deletions)."
+          else
+            echo "has_destructive=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate deployment (dry-run)
+        id: validate
+        if: steps.delta-check.outputs.has_changes == 'true'
+        run: |
+          DEPLOY_CMD="sf project deploy start \
+            --manifest delta/package/package.xml \
+            --dry-run \
+            --test-level RunLocalTests \
+            --coverage-formatters json-summary \
+            --results-dir results \
+            --wait 30 \
+            --json"
+
+          if [ "${{ steps.destructive-check.outputs.has_destructive }}" == "true" ]; then
+            DEPLOY_CMD="$DEPLOY_CMD --post-destructive-changes delta/destructiveChanges/destructiveChanges.xml"
+          fi
+
+          set +e
+          eval $DEPLOY_CMD | tee deploy-result.json
+          echo "deploy_exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Check code coverage threshold
+        if: steps.delta-check.outputs.has_changes == 'true'
+        run: |
+          if [ -f "results/coverage/coverage-summary.json" ]; then
+            COVERAGE=$(jq '.total.lines.pct' results/coverage/coverage-summary.json)
+            echo "Org-wide coverage: ${COVERAGE}%"
+            if (( $(echo "$COVERAGE < 75" | bc -l) )); then
+              echo "::error::Code coverage ${COVERAGE}% is below the 75% threshold"
+              exit 1
+            fi
+          else
+            echo "::warning::Coverage report not found. Ensure Apex tests produce coverage data."
+          fi
+
+      - name: Post deploy summary as PR comment
+        if: always() && steps.validate.outcome != 'skipped'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let summary = '## Deployment Validation Summary\n\n';
+
+            try {
+              const result = JSON.parse(fs.readFileSync('deploy-result.json', 'utf8'));
+              const status = result.status === 0 ? '✅ Passed' : '❌ Failed';
+              summary += `**Status:** ${status}\n\n`;
+
+              if (result.result) {
+                const r = result.result;
+                if (r.numberTestsCompleted !== undefined) {
+                  summary += `| Metric | Value |\n|--------|-------|\n`;
+                  summary += `| Tests Run | ${r.numberTestsCompleted} |\n`;
+                  summary += `| Test Failures | ${r.numberTestErrors || 0} |\n`;
+                  summary += `| Components Deployed | ${r.numberComponentsDeployed || 0} |\n`;
+                  summary += `| Component Errors | ${r.numberComponentErrors || 0} |\n\n`;
+                }
+              }
+            } catch (e) {
+              summary += '⚠️ Could not parse deployment result.\n\n';
+            }
+
+            if (fs.existsSync('results/coverage/coverage-summary.json')) {
+              const cov = JSON.parse(fs.readFileSync('results/coverage/coverage-summary.json', 'utf8'));
+              const pct = cov.total.lines.pct;
+              const icon = pct >= 75 ? '✅' : '❌';
+              summary += `**Coverage:** ${icon} ${pct}% (threshold: 75%)\n`;
+            }
+
+            const { data: comments } = await github.rest.issues.listComments({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            const existing = comments.find(c => c.body.includes('Deployment Validation Summary'));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                comment_id: existing.id,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: summary
+              });
+            } else {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: summary
+              });
+            }
+
+      - name: Upload deploy results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-results
+          path: |
+            deploy-result.json
+            results/
+          retention-days: 5

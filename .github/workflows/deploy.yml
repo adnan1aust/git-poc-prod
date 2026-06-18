@@ -1,0 +1,134 @@
+name: Deploy to Org
+
+on:
+  push:
+    branches: [uat, main]
+    paths:
+      - "force-app/**"
+      - "destructiveChanges/**"
+
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy Metadata
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'main' && 'production' || 'uat' }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Salesforce CLI
+        uses: salesforcecli/setup-sf-cli@v1
+        with:
+          version: latest
+
+      - name: Install sfdx-git-delta plugin
+        if: github.ref_name != 'main'
+        run: echo y | sf plugins install sfdx-git-delta
+
+      - name: Determine target org
+        id: org-config
+        run: |
+          if [[ "${{ github.ref_name }}" == "main" ]]; then
+            echo "org_alias=prod" >> "$GITHUB_OUTPUT"
+            echo "test_level=RunLocalTests" >> "$GITHUB_OUTPUT"
+            echo "deploy_mode=full" >> "$GITHUB_OUTPUT"
+          else
+            echo "org_alias=uat" >> "$GITHUB_OUTPUT"
+            echo "test_level=RunLocalTests" >> "$GITHUB_OUTPUT"
+            echo "deploy_mode=delta" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Authenticate to target org
+        env:
+          SF_AUTH_URL: ${{ github.ref_name == 'main' && secrets.PROD_SF_AUTH_URL || secrets.UAT_SF_AUTH_URL }}
+        run: |
+          echo "${SF_AUTH_URL}" | sf org login sfdx-url --sfdx-url-stdin --alias ${{ steps.org-config.outputs.org_alias }} --set-default
+
+      # --- Delta deployment (UAT only) ---
+      - name: Generate delta package
+        if: steps.org-config.outputs.deploy_mode == 'delta'
+        run: |
+          sf sgd source delta \
+            --from "HEAD~1" \
+            --to "HEAD" \
+            --output "delta" \
+            --generate-delta
+
+      - name: Check for delta changes
+        if: steps.org-config.outputs.deploy_mode == 'delta'
+        id: delta-check
+        run: |
+          if [ -f "delta/package/package.xml" ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No metadata changes to deploy."
+          fi
+
+      - name: Check for destructive changes
+        if: steps.org-config.outputs.deploy_mode == 'delta'
+        id: destructive-check
+        run: |
+          if [ -f "delta/destructiveChanges/destructiveChanges.xml" ]; then
+            echo "has_destructive=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_destructive=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy delta to UAT
+        if: steps.org-config.outputs.deploy_mode == 'delta' && steps.delta-check.outputs.has_changes == 'true'
+        run: |
+          DEPLOY_CMD="sf project deploy start \
+            --manifest delta/package/package.xml \
+            --test-level ${{ steps.org-config.outputs.test_level }} \
+            --wait 30 \
+            --json"
+
+          if [ "${{ steps.destructive-check.outputs.has_destructive }}" == "true" ]; then
+            DEPLOY_CMD="$DEPLOY_CMD --post-destructive-changes delta/destructiveChanges/destructiveChanges.xml"
+          fi
+
+          eval $DEPLOY_CMD | tee deploy-result.json
+
+      # --- Full deployment (Prod only) ---
+      - name: Deploy full source to Prod
+        if: steps.org-config.outputs.deploy_mode == 'full'
+        run: |
+          sf project deploy start \
+            --source-dir force-app \
+            --test-level ${{ steps.org-config.outputs.test_level }} \
+            --wait 30 \
+            --json | tee deploy-result.json
+
+      # --- Verify ---
+      - name: Verify deployment
+        id: verify
+        run: |
+          if [ ! -f "deploy-result.json" ]; then
+            echo "::notice::No deployment was executed (no changes detected)."
+            exit 0
+          fi
+          STATUS=$(jq -r '.status' deploy-result.json)
+          if [ "$STATUS" != "0" ]; then
+            echo "::error::Deployment failed"
+            jq '.result.details.componentFailures // empty' deploy-result.json
+            exit 1
+          fi
+          echo "::notice::Deployment successful to ${{ steps.org-config.outputs.org_alias }}"
+
+      - name: Upload deploy results
+        if: always() && hashFiles('deploy-result.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-results-${{ github.ref_name }}-${{ github.run_number }}
+          path: deploy-result.json
+          retention-days: 10
