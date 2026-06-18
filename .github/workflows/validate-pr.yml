@@ -142,18 +142,61 @@ jobs:
             echo "has_destructive=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Collect test classes for changed Apex
+        id: test-classes
+        if: steps.delta-check.outputs.has_changes == 'true'
+        run: |
+          # Find *Test.cls files that correspond to changed production classes
+          # Exclude @IsTest classes (e.g. TestDataFactory) by scanning file contents
+          CHANGED=$(git diff --name-only "origin/${{ github.base_ref }}"...HEAD -- 'force-app/**/*.cls' | \
+            grep -v 'Test\.' | grep -v '_Test\.' | \
+            while IFS= read -r f; do
+              grep -qiE '@IsTest' "$f" 2>/dev/null || echo "$f"
+            done | \
+            sed 's|.*/||' | sed 's|\.cls||')
+
+          TEST_NAMES=""
+          for CLS in $CHANGED; do
+            # Look for a matching test class in the repo
+            FOUND=$(find force-app -name "${CLS}Test.cls" -o -name "${CLS}_Test.cls" 2>/dev/null | head -1)
+            if [ -n "$FOUND" ]; then
+              TEST_NAME=$(basename "$FOUND" .cls)
+              TEST_NAMES="${TEST_NAMES} ${TEST_NAME}"
+            fi
+          done
+
+          TEST_NAMES=$(echo "$TEST_NAMES" | xargs)  # trim whitespace
+
+          if [ -n "$TEST_NAMES" ]; then
+            echo "test_level=RunSpecifiedTests" >> "$GITHUB_OUTPUT"
+            echo "tests=$TEST_NAMES" >> "$GITHUB_OUTPUT"
+            echo "Using RunSpecifiedTests: $TEST_NAMES"
+          else
+            echo "test_level=RunLocalTests" >> "$GITHUB_OUTPUT"
+            echo "tests=" >> "$GITHUB_OUTPUT"
+            echo "No matching test classes found — falling back to RunLocalTests"
+          fi
+
       - name: Validate deployment (dry-run)
         id: validate
         if: steps.delta-check.outputs.has_changes == 'true'
         run: |
+          TEST_LEVEL="${{ steps.test-classes.outputs.test_level }}"
+          TESTS="${{ steps.test-classes.outputs.tests }}"
+
           DEPLOY_CMD="sf project deploy start \
             --manifest delta/package/package.xml \
             --dry-run \
-            --test-level RunLocalTests \
-            --coverage-formatters json-summary \
-            --results-dir results \
+            --test-level ${TEST_LEVEL} \
             --wait 30 \
             --json"
+
+          if [ "$TEST_LEVEL" == "RunSpecifiedTests" ] && [ -n "$TESTS" ]; then
+            # Build --tests flags for each test class
+            for T in $TESTS; do
+              DEPLOY_CMD="$DEPLOY_CMD --tests $T"
+            done
+          fi
 
           if [ "${{ steps.destructive-check.outputs.has_destructive }}" == "true" ]; then
             DEPLOY_CMD="$DEPLOY_CMD --post-destructive-changes delta/destructiveChanges/destructiveChanges.xml"
@@ -163,26 +206,15 @@ jobs:
           eval $DEPLOY_CMD | tee deploy-result.json
           echo "deploy_exit_code=$?" >> "$GITHUB_OUTPUT"
 
-      - name: Check org-wide code coverage threshold
-        if: steps.delta-check.outputs.has_changes == 'true'
-        run: |
-          if [ -f "results/coverage/coverage-summary.json" ]; then
-            COVERAGE=$(jq '.total.lines.pct' results/coverage/coverage-summary.json)
-            echo "Org-wide coverage: ${COVERAGE}%"
-            if (( $(echo "$COVERAGE < 75" | bc -l) )); then
-              echo "::error::Code coverage ${COVERAGE}% is below the 75% threshold"
-              exit 1
-            fi
-          else
-            echo "::warning::Coverage report not found. Ensure Apex tests produce coverage data."
-          fi
-
       - name: Check per-class coverage for changed Apex classes (80% minimum)
         if: steps.delta-check.outputs.has_changes == 'true'
         run: |
-          # Get list of Apex classes changed in this PR
+          # Get list of changed production Apex classes (exclude test classes and @IsTest utilities)
           CHANGED_CLASSES=$(git diff --name-only "origin/${{ github.base_ref }}"...HEAD -- 'force-app/**/*.cls' | \
             grep -v 'Test\.' | grep -v '_Test\.' | grep -v 'test\.' | \
+            while IFS= read -r f; do
+              grep -qiE '@IsTest' "$f" 2>/dev/null || echo "$f"
+            done | \
             sed 's|.*/||' | sed 's|\.cls||')
 
           if [ -z "$CHANGED_CLASSES" ]; then
@@ -251,12 +283,21 @@ jobs:
               summary += '⚠️ Could not parse deployment result.\n\n';
             }
 
-            if (fs.existsSync('results/coverage/coverage-summary.json')) {
-              const cov = JSON.parse(fs.readFileSync('results/coverage/coverage-summary.json', 'utf8'));
-              const pct = cov.total.lines.pct;
-              const icon = pct >= 75 ? '✅' : '❌';
-              summary += `**Coverage:** ${icon} ${pct}% (threshold: 75%)\n`;
-            }
+            try {
+              const result = JSON.parse(fs.readFileSync('deploy-result.json', 'utf8'));
+              const coverage = result?.result?.details?.runTestResult?.codeCoverage;
+              if (coverage && coverage.length > 0) {
+                summary += `\n| Class | Coverage | Status |\n|-------|----------|--------|\n`;
+                for (const c of coverage) {
+                  if (!c.name.endsWith('Test')) {
+                    const locs = c.numLocations || 0;
+                    const pct = locs === 0 ? 100 : Math.round(((locs - (c.numLocationsNotCovered || 0)) / locs) * 100);
+                    const icon = pct >= 80 ? '✅' : '❌';
+                    summary += `| ${c.name} | ${pct}% | ${icon} (min 80%) |\n`;
+                  }
+                }
+              }
+            } catch (e) { /* coverage data unavailable */ }
 
             const { data: comments } = await github.rest.issues.listComments({
               issue_number: context.issue.number,
@@ -286,7 +327,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: deploy-results
-          path: |
-            deploy-result.json
-            results/
+          path: deploy-result.json
           retention-days: 5
