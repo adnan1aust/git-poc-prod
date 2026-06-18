@@ -26,9 +26,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install Salesforce CLI
-        uses: salesforcecli/setup-sf-cli@v1
-        with:
-          version: latest
+        run: npm install -g @salesforce/cli
 
       - name: Install sfdx-git-delta plugin
         if: github.ref_name != 'main'
@@ -51,12 +49,15 @@ jobs:
         env:
           SF_AUTH_URL: ${{ github.ref_name == 'main' && secrets.PROD_SF_AUTH_URL || secrets.UAT_SF_AUTH_URL }}
         run: |
-          echo "${SF_AUTH_URL}" | sf org login sfdx-url --sfdx-url-stdin --alias ${{ steps.org-config.outputs.org_alias }} --set-default
+          echo "${SF_AUTH_URL}" > /tmp/sfdx-auth-url.txt
+          sf org login sfdx-url --sfdx-url-file /tmp/sfdx-auth-url.txt --alias ${{ steps.org-config.outputs.org_alias }} --set-default
+          rm -f /tmp/sfdx-auth-url.txt
 
       # --- Delta deployment (UAT only) ---
       - name: Generate delta package
         if: steps.org-config.outputs.deploy_mode == 'delta'
         run: |
+          mkdir -p delta
           sf sgd source delta \
             --from "HEAD~1" \
             --to "HEAD" \

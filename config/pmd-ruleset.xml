@@ -1,10 +1,13 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<ruleset name="Salesforce Apex Rules"
+<?xml version="1.0" encoding="UTF-8" ?>
+<ruleset
+  name="Salesforce Apex Rules"
   xmlns="http://pmd.sourceforge.net/ruleset/2.0.0"
   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-  xsi:schemaLocation="http://pmd.sourceforge.net/ruleset/2.0.0 https://pmd.sourceforge.io/ruleset_2_0_0.xsd">
+  xsi:schemaLocation="http://pmd.sourceforge.net/ruleset/2.0.0 https://pmd.sourceforge.io/ruleset_2_0_0.xsd"
+>
 
-  <description>Custom PMD rules for Apex code quality enforcement in CI</description>
+  <description
+  >Custom PMD rules for Apex code quality enforcement in CI</description>
 
   <!-- Performance -->
   <rule ref="category/apex/performance.xml/OperationWithLimitsInLoop" />
@@ -13,8 +16,12 @@
   </rule>
 
   <!-- Best Practices -->
-  <rule ref="category/apex/bestpractices.xml/ApexUnitTestClassShouldHaveAsserts" />
-  <rule ref="category/apex/bestpractices.xml/ApexUnitTestShouldNotUseSeeAllDataTrue" />
+  <rule
+    ref="category/apex/bestpractices.xml/ApexUnitTestClassShouldHaveAsserts"
+  />
+  <rule
+    ref="category/apex/bestpractices.xml/ApexUnitTestShouldNotUseSeeAllDataTrue"
+  />
   <rule ref="category/apex/bestpractices.xml/AvoidGlobalModifier" />
   <rule ref="category/apex/bestpractices.xml/UnusedLocalVariable" />
 
