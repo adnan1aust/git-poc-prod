@@ -256,6 +256,53 @@ jobs:
             exit 1
           fi
 
+      - name: Check per-class coverage for changed Apex classes (80% minimum)
+        if: steps.delta-check.outputs.has_changes == 'true'
+        run: |
+          # Get list of Apex classes changed in this PR
+          CHANGED_CLASSES=$(git diff --name-only "origin/${{ github.base_ref }}"...HEAD -- 'force-app/**/*.cls' | \
+            grep -v 'Test\.' | grep -v '_Test\.' | grep -v 'test\.' | \
+            sed 's|.*/||' | sed 's|\.cls||')
+
+          if [ -z "$CHANGED_CLASSES" ]; then
+            echo "No non-test Apex classes changed in this PR."
+            exit 0
+          fi
+
+          echo "Changed Apex classes: $CHANGED_CLASSES"
+          FAILED=false
+
+          if [ -f "deploy-result.json" ]; then
+            for CLASS in $CHANGED_CLASSES; do
+              CLASS_COV=$(jq -r --arg cls "$CLASS" '
+                .result.details.runTestResult.codeCoverage[]? |
+                select(.name == $cls) |
+                (if (.numLocations // 0) == 0 then 100
+                 else (((.numLocations - .numLocationsNotCovered) / .numLocations) * 100)
+                 end)
+              ' deploy-result.json 2>/dev/null)
+
+              if [ -z "$CLASS_COV" ] || [ "$CLASS_COV" == "null" ]; then
+                echo "::error::Class '$CLASS' has no test coverage data. Ensure a test class covers it."
+                FAILED=true
+              elif (( $(echo "$CLASS_COV < 80" | bc -l) )); then
+                echo "::error::Class '$CLASS' has ${CLASS_COV}% coverage (minimum 80% required)"
+                FAILED=true
+              else
+                echo "✓ $CLASS: ${CLASS_COV}%"
+              fi
+            done
+          else
+            echo "::error::No deploy result found to check coverage."
+            FAILED=true
+          fi
+
+          if [ "$FAILED" == "true" ]; then
+            echo ""
+            echo "::error::One or more Apex classes do not meet the 80% per-class coverage requirement."
+            exit 1
+          fi
+
       - name: Post deploy summary as PR comment
         if: always() && steps.validate.outcome != 'skipped'
         uses: actions/github-script@v7
