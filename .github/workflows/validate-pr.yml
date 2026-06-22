@@ -132,6 +132,34 @@ jobs:
             echo "::notice::No metadata changes detected in this PR."
           fi
 
+      - name: Post no-changes comment
+        if: steps.delta-check.outputs.has_changes == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: comments } = await github.rest.issues.listComments({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            const existing = comments.find(c => c.body.includes('Deployment Validation Summary'));
+            const body = '## Deployment Validation Summary\n\nNo Salesforce metadata changes detected in this PR — deployment validation skipped.';
+            if (existing) {
+              await github.rest.issues.updateComment({
+                comment_id: existing.id,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body
+              });
+            }
+
       - name: Check for destructive changes
         id: destructive-check
         run: |
@@ -271,13 +299,15 @@ jobs:
 
               if (result.result) {
                 const r = result.result;
-                if (r.numberTestsCompleted !== undefined) {
-                  summary += `| Metric | Value |\n|--------|-------|\n`;
+                summary += `| Metric | Value |\n|--------|-------|\n`;
+                summary += `| Components Deployed | ${r.numberComponentsDeployed || 0} |\n`;
+                summary += `| Component Errors | ${r.numberComponentErrors || 0} |\n`;
+
+                if (r.numberTestsCompleted > 0) {
                   summary += `| Tests Run | ${r.numberTestsCompleted} |\n`;
                   summary += `| Test Failures | ${r.numberTestErrors || 0} |\n`;
-                  summary += `| Components Deployed | ${r.numberComponentsDeployed || 0} |\n`;
-                  summary += `| Component Errors | ${r.numberComponentErrors || 0} |\n\n`;
                 }
+                summary += '\n';
               }
             } catch (e) {
               summary += '⚠️ Could not parse deployment result.\n\n';
