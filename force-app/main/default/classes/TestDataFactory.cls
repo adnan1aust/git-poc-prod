@@ -29,4 +29,34 @@ public class TestDataFactory {
     }
     return accounts;
   }
+
+  /**
+   * Creates Lead records and optionally inserts them.
+   *
+   * @param count     Number of Lead records to create
+   * @param doInsert  When true, inserts the records before returning
+   * @return List of Lead records
+   * @example
+   * List<Lead> leads = TestDataFactory.createLeads(10, true);
+   */
+  public static List<Lead> createLeads(Integer count, Boolean doInsert) {
+    List<Lead> leads = new List<Lead>();
+    for (Integer i = 0; i < count; i++) {
+      leads.add(
+        new Lead(
+          FirstName = 'FirstName' + i,
+          LastName = 'LastName' + i,
+          Company = 'Test Company ' + i,
+          Email = 'lead' + i + '@testfactory.com',
+          Phone = '555-100-' + String.valueOf(i).leftPad(4, '0'),
+          LeadSource = 'Web',
+          Status = 'Open - Not Contacted'
+        )
+      );
+    }
+    if (doInsert) {
+      insert leads;
+    }
+    return leads;
+  }
 }
