@@ -59,4 +59,33 @@ public class TestDataFactory {
     }
     return leads;
   }
+
+  /**
+   * Creates Contact records and optionally inserts them.
+   *
+   * @param count     Number of Contact records to create
+   * @param doInsert  When true, inserts the records before returning
+   * @return List of Contact records
+   * @example
+   * List<Contact> contacts = TestDataFactory.createContacts(10, true);
+   */
+  public static List<Contact> createContacts(Integer count, Boolean doInsert) {
+    List<Contact> contacts = new List<Contact>();
+    for (Integer i = 0; i < count; i++) {
+      contacts.add(
+        new Contact(
+          FirstName = 'FirstName' + i,
+          LastName = 'LastName' + i,
+          Email = 'contact' + i + '@testfactory.com',
+          Phone = '555-200-' + String.valueOf(i).leftPad(4, '0'),
+          LeadSource = 'Web',
+          Title = 'Title ' + i
+        )
+      );
+    }
+    if (doInsert) {
+      insert contacts;
+    }
+    return contacts;
+  }
 }
