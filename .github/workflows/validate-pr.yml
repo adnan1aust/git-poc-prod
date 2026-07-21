@@ -56,26 +56,119 @@ jobs:
       - name: Install Salesforce CLI
         run: npm install -g @salesforce/cli
 
-      - name: Install Code Analyzer plugin
-        run: sf plugins install @salesforce/sfdx-scanner
-
-      - name: Create results directory
-        run: mkdir -p results
+      - name: Install Code Analyzer plugin (v5)
+        run: sf plugins install code-analyzer
 
       - name: Run Code Analyzer
         id: scanner
         run: |
-          sf scanner run \
-            --target "force-app" \
-            --pmdconfig "config/pmd-ruleset.xml" \
-            --format sarif \
-            --outfile results/scanner-report.sarif \
-            --severity-threshold 2 || echo "scanner_failed=true" >> "$GITHUB_OUTPUT"
+          mkdir -p results
+          set +e
+          sf code-analyzer run \
+            --workspace "force-app" \
+            --rule-selector "SalesforceApexRules" \
+            --config-file "code-analyzer.yml" \
+            --output-file results/scanner-report.json \
+            --output-file results/scanner-report.html \
+            --severity-threshold 2
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
 
-      - name: Fail if scanner found critical issues
-        if: steps.scanner.outputs.scanner_failed == 'true'
+      # Report via job summary + PR comment + artifact.
+      # Deliberately NOT using the Security tab (SARIF upload), which requires
+      # GitHub Advanced Security on private repos.
+      - name: Write findings to job summary
+        if: always()
         run: |
-          echo "::error::Code Analyzer found High or Critical severity findings. Check the Security tab for details."
+          {
+            echo "## Salesforce Code Analyzer Report"
+            echo ""
+            if [ -f results/scanner-report.json ]; then
+              TOTAL=$(jq '(.violations // []) | length' results/scanner-report.json)
+              echo "**Total violations:** ${TOTAL}"
+              echo ""
+              if [ "$TOTAL" -gt 0 ]; then
+                echo "| Rule | Severity | Location | Message |"
+                echo "|------|----------|----------|---------|"
+                jq -r '
+                  (.violations // [])[:30][] |
+                  "| " + (.rule // "?") +
+                  " | " + ((.severity // "?") | tostring) +
+                  " | " + ((.locations[(.primaryLocationIndex // 0)].file // "?") | sub(".*force-app/"; "force-app/")) +
+                  ":" + ((.locations[(.primaryLocationIndex // 0)].startLine // 0) | tostring) +
+                  " | " + ((.message // "") | gsub("[\n|]"; " ") | .[0:120]) + " |"
+                ' results/scanner-report.json
+                echo ""
+                echo "_Severity: 1=Critical, 2=High, 3=Moderate, 4=Low, 5=Info. Showing first 30; full report in the 'code-analyzer-report' artifact._"
+              fi
+            else
+              echo "No report generated — the analyzer run itself may have errored. Check the step logs."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post findings as PR comment
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let body = '## Code Analyzer Report\n\n';
+            try {
+              const report = JSON.parse(fs.readFileSync('results/scanner-report.json', 'utf8'));
+              const violations = report.violations || [];
+              const blocking = violations.filter(v => (v.severity || 5) <= 2).length;
+              body += `**Total violations:** ${violations.length} (${blocking} blocking at severity ≤ 2)\n\n`;
+              if (violations.length > 0) {
+                body += '| Rule | Sev | Location | Message |\n|------|-----|----------|--------|\n';
+                for (const v of violations.slice(0, 25)) {
+                  const loc = (v.locations || [])[v.primaryLocationIndex || 0] || {};
+                  const file = (loc.file || '?').replace(/.*force-app\//, 'force-app/');
+                  const msg = (v.message || '').replace(/[\n|]/g, ' ').slice(0, 120);
+                  body += `| ${v.rule || '?'} | ${v.severity ?? '?'} | ${file}:${loc.startLine || 0} | ${msg} |\n`;
+                }
+                if (violations.length > 25) {
+                  body += `\n_…and ${violations.length - 25} more. Full report in the workflow run's 'code-analyzer-report' artifact._\n`;
+                }
+              } else {
+                body += '✅ No violations found.\n';
+              }
+            } catch (e) {
+              body += '⚠️ Could not read the analyzer report — the run may have errored. Check the workflow logs.\n';
+            }
+
+            const { data: comments } = await github.rest.issues.listComments({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            const existing = comments.find(c => c.body.includes('Code Analyzer Report'));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                comment_id: existing.id,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body
+              });
+            }
+
+      - name: Upload Code Analyzer reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-analyzer-report
+          path: results/
+          retention-days: 5
+
+      - name: Fail if severity threshold exceeded
+        if: steps.scanner.outputs.exit_code != '0'
+        run: |
+          echo "::error::Code Analyzer found findings at or above severity 2 (High), or the run errored. See the job summary, PR comment, or 'code-analyzer-report' artifact."
           exit 1
 
   validate-deploy:
@@ -116,8 +209,12 @@ jobs:
       - name: Generate delta package (changed metadata only)
         run: |
           mkdir -p delta
+          # Use the merge base so commits on the target branch that are not yet
+          # in this PR branch are not mis-detected as changes/deletions.
+          BASE_SHA=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
+          echo "Delta range: ${BASE_SHA}..HEAD"
           sf sgd source delta \
-            --from "origin/${{ github.base_ref }}" \
+            --from "$BASE_SHA" \
             --to "HEAD" \
             --output "delta" \
             --generate-delta
@@ -174,14 +271,28 @@ jobs:
         id: test-classes
         if: steps.delta-check.outputs.has_changes == 'true'
         run: |
-          # Find *Test.cls files that correspond to changed production classes
-          # Exclude @IsTest classes (e.g. TestDataFactory) by scanning file contents
-          CHANGED=$(git diff --name-only "origin/${{ github.base_ref }}"...HEAD -- 'force-app/**/*.cls' | \
+          # Find changed production Apex (classes AND triggers), excluding test
+          # classes and @IsTest utilities (e.g. TestDataFactory).
+          CHANGED=$(git diff --name-only "origin/${{ github.base_ref }}"...HEAD -- 'force-app/**/*.cls' 'force-app/**/*.trigger' | \
             grep -v 'Test\.' | grep -v '_Test\.' | \
             while IFS= read -r f; do
               grep -qiE '@IsTest' "$f" 2>/dev/null || echo "$f"
             done | \
-            sed 's|.*/||' | sed 's|\.cls||')
+            sed 's|.*/||' | sed -E 's/\.(cls|trigger)$//' | xargs)
+
+          echo "changed_apex=$CHANGED" >> "$GITHUB_OUTPUT"
+
+          # PR contains no Apex: validate without any test level. Salesforce
+          # runs no tests for a package without Apex (including production
+          # validations), so no coverage data is produced or displayed.
+          if [ -z "$CHANGED" ]; then
+            echo "has_apex=false" >> "$GITHUB_OUTPUT"
+            echo "test_level=" >> "$GITHUB_OUTPUT"
+            echo "tests=" >> "$GITHUB_OUTPUT"
+            echo "No Apex classes or triggers changed — skipping test execution."
+            exit 0
+          fi
+          echo "has_apex=true" >> "$GITHUB_OUTPUT"
 
           TEST_NAMES=""
           for CLS in $CHANGED; do
@@ -202,7 +313,7 @@ jobs:
           else
             echo "test_level=RunLocalTests" >> "$GITHUB_OUTPUT"
             echo "tests=" >> "$GITHUB_OUTPUT"
-            echo "No matching test classes found — falling back to RunLocalTests"
+            echo "Apex changed but no matching test classes found — falling back to RunLocalTests"
           fi
 
       - name: Validate deployment (dry-run)
@@ -215,9 +326,15 @@ jobs:
           DEPLOY_CMD="sf project deploy start \
             --manifest delta/package/package.xml \
             --dry-run \
-            --test-level ${TEST_LEVEL} \
             --wait 30 \
             --json"
+
+          # Only pass --test-level when the PR actually contains Apex. Without
+          # Apex in the package, the platform runs no tests and produces no
+          # coverage data (so none is shown in the PR comment).
+          if [ -n "$TEST_LEVEL" ]; then
+            DEPLOY_CMD="$DEPLOY_CMD --test-level ${TEST_LEVEL}"
+          fi
 
           if [ "$TEST_LEVEL" == "RunSpecifiedTests" ] && [ -n "$TESTS" ]; then
             # Build --tests flags for each test class
@@ -231,22 +348,30 @@ jobs:
           fi
 
           set +e
+          set -o pipefail
           eval $DEPLOY_CMD | tee deploy-result.json
-          echo "deploy_exit_code=$?" >> "$GITHUB_OUTPUT"
+          DEPLOY_EXIT=$?
+          set -e
+          echo "deploy_exit_code=$DEPLOY_EXIT" >> "$GITHUB_OUTPUT"
+
+          # Gate the job on the actual validation result. Without this check a
+          # failed dry-run (e.g. on config-only PRs with no Apex changes) would
+          # let the PR check pass green.
+          STATUS=$(jq -r '.status // 1' deploy-result.json 2>/dev/null || echo 1)
+          if [ "$STATUS" != "0" ]; then
+            echo "::error::Deployment validation failed. Component failures (if any):"
+            jq '.result.details.componentFailures // empty' deploy-result.json 2>/dev/null || true
+            exit 1
+          fi
 
       - name: Check per-class coverage for changed Apex classes (80% minimum)
-        if: steps.delta-check.outputs.has_changes == 'true'
+        if: steps.delta-check.outputs.has_changes == 'true' && steps.test-classes.outputs.has_apex == 'true'
         run: |
-          # Get list of changed production Apex classes (exclude test classes and @IsTest utilities)
-          CHANGED_CLASSES=$(git diff --name-only "origin/${{ github.base_ref }}"...HEAD -- 'force-app/**/*.cls' | \
-            grep -v 'Test\.' | grep -v '_Test\.' | grep -v 'test\.' | \
-            while IFS= read -r f; do
-              grep -qiE '@IsTest' "$f" 2>/dev/null || echo "$f"
-            done | \
-            sed 's|.*/||' | sed 's|\.cls||')
+          # Reuse the changed Apex list (classes + triggers) computed earlier.
+          CHANGED_CLASSES="${{ steps.test-classes.outputs.changed_apex }}"
 
           if [ -z "$CHANGED_CLASSES" ]; then
-            echo "No non-test Apex classes changed in this PR."
+            echo "No non-test Apex classes or triggers changed in this PR."
             exit 0
           fi
 
@@ -314,12 +439,18 @@ jobs:
             }
 
             try {
+              // Only show coverage for Apex actually changed in this PR.
+              // A PR without Apex changes shows no coverage table at all.
+              const changedApex = '${{ steps.test-classes.outputs.changed_apex }}'
+                .split(/\s+/)
+                .filter(Boolean);
               const result = JSON.parse(fs.readFileSync('deploy-result.json', 'utf8'));
               const coverage = result?.result?.details?.runTestResult?.codeCoverage;
-              if (coverage && coverage.length > 0) {
-                summary += `\n| Class | Coverage | Status |\n|-------|----------|--------|\n`;
-                for (const c of coverage) {
-                  if (!c.name.endsWith('Test')) {
+              if (changedApex.length > 0 && coverage && coverage.length > 0) {
+                const rows = coverage.filter(c => changedApex.includes(c.name));
+                if (rows.length > 0) {
+                  summary += `\n| Class | Coverage | Status |\n|-------|----------|--------|\n`;
+                  for (const c of rows) {
                     const locs = c.numLocations || 0;
                     const pct = locs === 0 ? 100 : Math.round(((locs - (c.numLocationsNotCovered || 0)) / locs) * 100);
                     const icon = pct >= 80 ? '✅' : '❌';
