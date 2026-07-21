@@ -58,8 +58,19 @@ jobs:
         if: steps.org-config.outputs.deploy_mode == 'delta'
         run: |
           mkdir -p delta
+          # Diff against the commit the branch pointed at before this push, so
+          # multi-commit pushes and merge commits are fully captured (HEAD~1
+          # would miss all but the last commit).
+          FROM_SHA="${{ github.event.before }}"
+          if [ -z "$FROM_SHA" ] || \
+             [ "$FROM_SHA" = "0000000000000000000000000000000000000000" ] || \
+             ! git cat-file -e "${FROM_SHA}^{commit}" 2>/dev/null; then
+            echo "::warning::Push base SHA unavailable; falling back to HEAD~1."
+            FROM_SHA="HEAD~1"
+          fi
+          echo "Delta range: ${FROM_SHA}..HEAD"
           sf sgd source delta \
-            --from "HEAD~1" \
+            --from "$FROM_SHA" \
             --to "HEAD" \
             --output "delta" \
             --generate-delta
@@ -68,7 +79,17 @@ jobs:
         if: steps.org-config.outputs.deploy_mode == 'delta'
         id: delta-check
         run: |
-          if [ -f "delta/package/package.xml" ]; then
+          # sfdx-git-delta always writes a package.xml, even when empty — check
+          # for actual <types> content. Destructive-only pushes still deploy.
+          HAS_TYPES=false
+          HAS_DESTRUCTIVE=false
+          if [ -f "delta/package/package.xml" ] && grep -q "<types>" "delta/package/package.xml"; then
+            HAS_TYPES=true
+          fi
+          if [ -f "delta/destructiveChanges/destructiveChanges.xml" ] && grep -q "<types>" "delta/destructiveChanges/destructiveChanges.xml"; then
+            HAS_DESTRUCTIVE=true
+          fi
+          if [ "$HAS_TYPES" = "true" ] || [ "$HAS_DESTRUCTIVE" = "true" ]; then
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
@@ -79,7 +100,7 @@ jobs:
         if: steps.org-config.outputs.deploy_mode == 'delta'
         id: destructive-check
         run: |
-          if [ -f "delta/destructiveChanges/destructiveChanges.xml" ]; then
+          if [ -f "delta/destructiveChanges/destructiveChanges.xml" ] && grep -q "<types>" "delta/destructiveChanges/destructiveChanges.xml"; then
             echo "has_destructive=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_destructive=false" >> "$GITHUB_OUTPUT"

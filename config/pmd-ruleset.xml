@@ -9,8 +9,15 @@
   <description
   >Custom PMD rules for Apex code quality enforcement in CI</description>
 
+  <!-- NOTE on priorities: Code Analyzer v5 derives severity from PMD priority
+       (priority 1 -> severity 2/High). CI fails at severity <= 2, so rules
+       that must block a PR need an explicit <priority>1</priority>. Rules
+       without a priority default to Moderate (non-blocking, report-only). -->
+
   <!-- Performance -->
-  <rule ref="category/apex/performance.xml/OperationWithLimitsInLoop" />
+  <rule ref="category/apex/performance.xml/OperationWithLimitsInLoop">
+    <priority>1</priority>
+  </rule>
   <rule ref="category/apex/performance.xml/AvoidDebugStatements">
     <priority>3</priority>
   </rule>
@@ -25,13 +32,25 @@
   <rule ref="category/apex/bestpractices.xml/AvoidGlobalModifier" />
   <rule ref="category/apex/bestpractices.xml/UnusedLocalVariable" />
 
-  <!-- Security -->
-  <rule ref="category/apex/security.xml/ApexCRUDViolation" />
-  <rule ref="category/apex/security.xml/ApexSharingViolations" />
-  <rule ref="category/apex/security.xml/ApexSOQLInjection" />
-  <rule ref="category/apex/security.xml/ApexOpenRedirect" />
-  <rule ref="category/apex/security.xml/ApexXSSFromURLParam" />
-  <rule ref="category/apex/security.xml/ApexXSSFromEscapeFalse" />
+  <!-- Security (priority 1 = blocking in CI) -->
+  <rule ref="category/apex/security.xml/ApexCRUDViolation">
+    <priority>1</priority>
+  </rule>
+  <rule ref="category/apex/security.xml/ApexSharingViolations">
+    <priority>1</priority>
+  </rule>
+  <rule ref="category/apex/security.xml/ApexSOQLInjection">
+    <priority>1</priority>
+  </rule>
+  <rule ref="category/apex/security.xml/ApexOpenRedirect">
+    <priority>1</priority>
+  </rule>
+  <rule ref="category/apex/security.xml/ApexXSSFromURLParam">
+    <priority>1</priority>
+  </rule>
+  <rule ref="category/apex/security.xml/ApexXSSFromEscapeFalse">
+    <priority>1</priority>
+  </rule>
 
   <!-- Error Prone -->
   <rule ref="category/apex/errorprone.xml/AvoidHardcodingId" />

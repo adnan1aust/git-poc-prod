@@ -1,0 +1,17 @@
+# Salesforce Code Analyzer v5 configuration
+# Docs: https://developer.salesforce.com/docs/platform/salesforce-code-analyzer/guide/config-custom.html
+#
+# The custom PMD ruleset below is registered with the analyzer. Its rules are
+# selectable via the tag "SalesforceApexRules" (ruleset name minus spaces),
+# which is what the CI workflow passes to --rule-selector.
+
+engines:
+  pmd:
+    custom_rulesets:
+      - "config/pmd-ruleset.xml"
+
+  # LWC/Aura JavaScript is already linted in CI via the project's own ESLint
+  # flat config (npm run lint). Disable the analyzer's bundled ESLint engine
+  # to avoid duplicate, conflicting findings.
+  eslint:
+    disable_engine: true
