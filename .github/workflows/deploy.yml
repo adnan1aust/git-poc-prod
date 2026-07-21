@@ -79,7 +79,17 @@ jobs:
         if: steps.org-config.outputs.deploy_mode == 'delta'
         id: delta-check
         run: |
-          if [ -f "delta/package/package.xml" ]; then
+          # sfdx-git-delta always writes a package.xml, even when empty — check
+          # for actual <types> content. Destructive-only pushes still deploy.
+          HAS_TYPES=false
+          HAS_DESTRUCTIVE=false
+          if [ -f "delta/package/package.xml" ] && grep -q "<types>" "delta/package/package.xml"; then
+            HAS_TYPES=true
+          fi
+          if [ -f "delta/destructiveChanges/destructiveChanges.xml" ] && grep -q "<types>" "delta/destructiveChanges/destructiveChanges.xml"; then
+            HAS_DESTRUCTIVE=true
+          fi
+          if [ "$HAS_TYPES" = "true" ] || [ "$HAS_DESTRUCTIVE" = "true" ]; then
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
@@ -90,7 +100,7 @@ jobs:
         if: steps.org-config.outputs.deploy_mode == 'delta'
         id: destructive-check
         run: |
-          if [ -f "delta/destructiveChanges/destructiveChanges.xml" ]; then
+          if [ -f "delta/destructiveChanges/destructiveChanges.xml" ] && grep -q "<types>" "delta/destructiveChanges/destructiveChanges.xml"; then
             echo "has_destructive=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_destructive=false" >> "$GITHUB_OUTPUT"

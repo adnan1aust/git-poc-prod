@@ -222,11 +222,22 @@ jobs:
       - name: Check for deployable changes
         id: delta-check
         run: |
-          if [ -f "delta/package/package.xml" ]; then
+          # sfdx-git-delta always writes a package.xml, even when empty — so
+          # check for actual <types> content, not just file existence. A PR is
+          # deployable if it has metadata changes OR destructive changes.
+          HAS_TYPES=false
+          HAS_DESTRUCTIVE=false
+          if [ -f "delta/package/package.xml" ] && grep -q "<types>" "delta/package/package.xml"; then
+            HAS_TYPES=true
+          fi
+          if [ -f "delta/destructiveChanges/destructiveChanges.xml" ] && grep -q "<types>" "delta/destructiveChanges/destructiveChanges.xml"; then
+            HAS_DESTRUCTIVE=true
+          fi
+          if [ "$HAS_TYPES" = "true" ] || [ "$HAS_DESTRUCTIVE" = "true" ]; then
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::No metadata changes detected in this PR."
+            echo "::notice::No deployable metadata changes detected in this PR."
           fi
 
       - name: Post no-changes comment
@@ -260,7 +271,7 @@ jobs:
       - name: Check for destructive changes
         id: destructive-check
         run: |
-          if [ -f "delta/destructiveChanges/destructiveChanges.xml" ]; then
+          if [ -f "delta/destructiveChanges/destructiveChanges.xml" ] && grep -q "<types>" "delta/destructiveChanges/destructiveChanges.xml"; then
             echo "has_destructive=true" >> "$GITHUB_OUTPUT"
             echo "::warning::This PR contains destructive changes (metadata deletions)."
           else
